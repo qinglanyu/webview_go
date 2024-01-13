@@ -29,6 +29,7 @@ import (
 	"runtime"
 	"sync"
 	"unsafe"
+	"fmt"
 )
 
 func init() {
@@ -90,6 +91,8 @@ type WebView interface {
 	// w.Navigate("data:text/html;base64,PGgxPkhlbGxvPC9oMT4=")
 	Navigate(url string)
 
+	GetCookie(url string) string
+
 	// SetHtml sets the webview HTML directly.
 	// Example: w.SetHtml(w, "<h1>Hello</h1>");
 	SetHtml(html string)
@@ -135,7 +138,7 @@ func boolToInt(b bool) C.int {
 
 // New calls NewWindow to create a new window and a new webview instance. If debug
 // is non-zero - developer tools will be enabled (if the platform supports them).
-func New(debug bool) WebView { return NewWindow(debug, nil) }
+func New(debug bool, datapath string) WebView { return NewWindow(debug, datapath, nil) }
 
 // NewWindow creates a new webview instance. If debug is non-zero - developer
 // tools will be enabled (if the platform supports them). Window parameter can be
@@ -143,9 +146,11 @@ func New(debug bool) WebView { return NewWindow(debug, nil) }
 // embedded into the given parent window. Otherwise a new window is created.
 // Depending on the platform, a GtkWindow, NSWindow or HWND pointer can be passed
 // here.
-func NewWindow(debug bool, window unsafe.Pointer) WebView {
+func NewWindow(debug bool, datapath string, window unsafe.Pointer) WebView {
 	w := &webview{}
-	w.w = C.webview_create(boolToInt(debug), window)
+	path := C.CString(datapath)
+	defer C.free(unsafe.Pointer(path))
+	w.w = C.webview_create(boolToInt(debug), path, window)
 	return w
 }
 
@@ -169,6 +174,14 @@ func (w *webview) Navigate(url string) {
 	s := C.CString(url)
 	defer C.free(unsafe.Pointer(s))
 	C.webview_navigate(w.w, s)
+}
+
+func (w *webview) GetCookie(url string) string {
+	s := C.CString(url)
+	defer C.free(unsafe.Pointer(s))
+	cookie := C.webview_get_cookie(w.w, s)
+	fmt.Println("rm this line after debug...")
+	return C.GoString(cookie)
 }
 
 func (w *webview) SetHtml(html string) {
