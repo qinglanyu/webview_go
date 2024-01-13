@@ -103,7 +103,7 @@ typedef void *webview_t;
 // passed here. Returns null on failure. Creation can fail for various reasons
 // such as when required runtime dependencies are missing or when window creation
 // fails.
-WEBVIEW_API webview_t webview_create(int debug, void *window);
+WEBVIEW_API webview_t webview_create(int debug, const char *datapath, void *window);
 
 // Destroys a webview and closes the native window.
 WEBVIEW_API void webview_destroy(webview_t w);
@@ -125,6 +125,8 @@ webview_dispatch(webview_t w, void (*fn)(webview_t w, void *arg), void *arg);
 // is a GtkWindow pointer, when using a Cocoa backend the pointer is a NSWindow
 // pointer, when using a Win32 backend the pointer is a HWND pointer.
 WEBVIEW_API void *webview_get_window(webview_t w);
+
+WEBVIEW_API const char* webview_get_cookie(webview_t w, const char *url);
 
 // Updates the title of the native window. Must be called from the UI thread.
 WEBVIEW_API void webview_set_title(webview_t w, const char *title);
@@ -1128,6 +1130,8 @@ using browser_engine = detail::cocoa_wkwebview_engine;
 #include <shlwapi.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <stdio.h>
+#include <regex>
 
 #include "WebView2.h"
 
@@ -1193,6 +1197,19 @@ inline std::string narrow_string(const std::wstring &input) {
   }
   // Failed to convert string from UTF-16 to UTF-8
   return std::string();
+}
+
+std::string WChar2Ansi(LPCWSTR pwszSrc) {
+    if (pwszSrc == nullptr) {
+        return "";
+    }
+    int len = WideCharToMultiByte(CP_ACP, 0, pwszSrc, -1, nullptr, 0, nullptr, nullptr);
+    if (len == 0) {
+        return "";
+    }
+    std::string str(len, '\0');
+    WideCharToMultiByte(CP_ACP, 0, pwszSrc, -1, &str[0], len, nullptr, nullptr);
+    return str;
 }
 
 // Parses a version string with 1-4 integral components, e.g. "1.2.3.4".
@@ -1694,8 +1711,16 @@ static constexpr IID
         0x4F,       0xEE,   0x6C,   0xC1, 0x4D};
 static constexpr IID IID_ICoreWebView2PermissionRequestedEventHandler{
     0x15E1C6A3, 0xC72A, 0x4DF3, 0x91, 0xD7, 0xD0, 0x97, 0xFB, 0xEC, 0x6B, 0xFD};
+static constexpr IID IID_ICoreWebView2ExecuteScriptCompletedHandler{
+    0x49511172, 0xcc67, 0x4bca, 0x99, 0x23, 0x13, 0x71, 0x12, 0xf4, 0xc4, 0xcc};
+static constexpr IID IID_ICoreWebView2GetCookiesCompletedHandler{
+    0x15e1c6a3, 0xc72a, 0x4df3, 0x91, 0xd7, 0xd0, 0x97, 0xfb, 0xec, 0x6b, 0xfd};
 static constexpr IID IID_ICoreWebView2WebMessageReceivedEventHandler{
     0x57213F19, 0x00E6, 0x49FA, 0x8E, 0x07, 0x89, 0x8E, 0xA0, 0x1E, 0xCB, 0xD2};
+static constexpr IID IID_ICoreWebView2_2{
+    0x9E8F0CF8, 0xE670, 0x4B5E, 0xB2, 0xBC, 0x73, 0xE0, 0x61, 0xE3, 0x18, 0x4C};
+static constexpr IID IID_ICoreWebView2CookieManager_Priv{
+    0x177CD9E7, 0xB6F5, 0x451A, 0x94, 0xA0, 0x5D, 0x7A, 0x3A, 0x4C, 0x41, 0x41};
 
 #if WEBVIEW_MSWEBVIEW2_BUILTIN_IMPL == 1
 enum class webview2_runtime_type { installed = 0, embedded = 1 };
@@ -1944,6 +1969,18 @@ static constexpr auto message_received =
 static constexpr auto permission_requested =
     cast_info_t<ICoreWebView2PermissionRequestedEventHandler>{
         IID_ICoreWebView2PermissionRequestedEventHandler};
+
+static constexpr auto executescript_completed = 
+    cast_info_t<ICoreWebView2ExecuteScriptCompletedHandler>{
+        IID_ICoreWebView2ExecuteScriptCompletedHandler};
+
+static constexpr auto cookies_got =
+    cast_info_t<ICoreWebView2GetCookiesCompletedHandler>{
+        IID_ICoreWebView2GetCookiesCompletedHandler};
+
+static constexpr auto ICoreWebView2_2_intf = 
+    cast_info_t<ICoreWebView2_2> {
+        IID_ICoreWebView2_2};
 } // namespace cast_info
 } // namespace mswebview2
 
@@ -1951,6 +1988,8 @@ class webview2_com_handler
     : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
       public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
       public ICoreWebView2WebMessageReceivedEventHandler,
+      public ICoreWebView2ExecuteScriptCompletedHandler,
+      public ICoreWebView2GetCookiesCompletedHandler,
       public ICoreWebView2PermissionRequestedEventHandler {
   using webview2_com_handler_cb_t =
       std::function<void(ICoreWebView2Controller *, ICoreWebView2 *webview)>;
@@ -1993,6 +2032,8 @@ public:
     if (cast_if_equal_iid(riid, controller_completed, ppv) ||
         cast_if_equal_iid(riid, environment_completed, ppv) ||
         cast_if_equal_iid(riid, message_received, ppv) ||
+        cast_if_equal_iid(riid, executescript_completed, ppv) ||
+        cast_if_equal_iid(riid, cookies_got, ppv) ||
         cast_if_equal_iid(riid, permission_requested, ppv)) {
       return S_OK;
     }
@@ -2037,6 +2078,7 @@ public:
       ICoreWebView2 *sender, ICoreWebView2WebMessageReceivedEventArgs *args) {
     LPWSTR message;
     args->TryGetWebMessageAsString(&message);
+    printf("invoke msg: %s\n", narrow_string(message).c_str());
     m_msgCb(narrow_string(message));
     sender->PostWebMessageAsString(message);
 
@@ -2053,6 +2095,115 @@ public:
     }
     return S_OK;
   }
+
+    HRESULT STDMETHODCALLTYPE Invoke(/* [in] */ HRESULT errorCode, /* [in] */ LPCWSTR resultObjectAsJson) {
+        // get cookie by ExecuteScriopt;
+        m_cookie = WChar2Ansi(resultObjectAsJson);
+        printf("ICoreWebView2ExecuteScriptCompletedHandler Invoke get cookie: %s\n", m_cookie.c_str());
+        return errorCode;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2CookieList *cookieList) {
+        printf("getcookieList result: %d\n", result);
+        if (/*result == S_OK*/1) {
+            printf("make cookie refer to learn.microsoft.com\n");
+            // parse cookieList to m_cookie refer to 
+            // https://learn.microsoft.com/zh-cn/microsoft-edge/webview2/reference/win32/icorewebview2cookiemanager?view=webview2-1.0.2210.55#getcookies
+            std::wstring wstrResult;
+            UINT cookie_list_size;
+            cookieList->get_Count(&cookie_list_size);
+            if (cookie_list_size == 0) {
+                wstrResult += L"No cookies found.";
+            } else {
+                wstrResult += std::to_wstring(cookie_list_size) + L"cookie(s) found";
+                wstrResult += L"\n\n[";
+                for (UINT i = 0; i < cookie_list_size; ++i) {
+                    ICoreWebView2Cookie *cookie = nullptr;
+                    cookieList->GetValueAtIndex(i, &cookie);
+
+                    if (cookie) {
+                        wstrResult += CookieToString(cookie);
+                        if (i != cookie_list_size - 1) {
+                            wstrResult += L",\n";
+                        }
+                    }
+                }
+                wstrResult += L"]";
+            }
+            m_cookie = narrow_string(wstrResult);
+            printf("the combined cookie:%s\n", m_cookie.c_str());
+        }
+        return result;
+    }
+
+    const char* get_cookie() {
+        return m_cookie.c_str();
+    }
+
+    std::wstring EncodeQuote(std::wstring raw) {
+        return L"\"" + regex_replace(raw, std::wregex(L"\""), L"\\\"") + L"\"";
+    }
+
+    std::wstring BoolToString(BOOL value) {
+        return value ? L"true" : L"false";
+    }
+
+
+    std::wstring CookieToString(ICoreWebView2Cookie* cookie) {
+        //! [CookieObject]
+        LPWSTR name;
+        cookie->get_Name(&name);
+        LPWSTR value;
+        cookie->get_Value(&value);
+        LPWSTR domain;
+        cookie->get_Domain(&domain);
+        LPWSTR path;
+        cookie->get_Path(&path);
+        double expires;
+        cookie->get_Expires(&expires);
+        BOOL isHttpOnly = FALSE;
+        cookie->get_IsHttpOnly(&isHttpOnly);
+        COREWEBVIEW2_COOKIE_SAME_SITE_KIND same_site;
+        std::wstring same_site_as_string;
+        cookie->get_SameSite(&same_site);
+        switch (same_site) {
+        case COREWEBVIEW2_COOKIE_SAME_SITE_KIND_NONE:
+            same_site_as_string = L"None";
+            break;
+        case COREWEBVIEW2_COOKIE_SAME_SITE_KIND_LAX:
+            same_site_as_string = L"Lax";
+            break;
+        case COREWEBVIEW2_COOKIE_SAME_SITE_KIND_STRICT:
+            same_site_as_string = L"Strict";
+            break;
+        }
+        BOOL isSecure = FALSE;
+        cookie->get_IsSecure(&isSecure);
+        BOOL isSession = FALSE;
+        cookie->get_IsSession(&isSession);
+
+        // Fix domain name for login.microsoftonline.com
+        std::wstring domainName = domain; // domain.get()
+        if (domainName == L".login.microsoftonline.com") {
+            domainName = L"login.microsoftonline.com";
+        }
+        // End
+
+        std::wstring result = L"{";
+        result += L"\"name\": " + EncodeQuote(name) + L", " + L"\"value\": " +
+            EncodeQuote(value) + L", " + L"\"domain\": " + EncodeQuote(domainName) +
+            L", " + L"\"path\": " + EncodeQuote(path) + L", " + L"\"httpOnly\": " +
+            BoolToString(isHttpOnly) + L", " + L"\"expirationDate\": ";
+        if (!!isSession) {
+            result += std::to_wstring(9999999999);
+        } else {
+            std::wstring formatted_expiration = std::to_wstring(expires).substr(0, std::to_wstring(expires).find(L"."));
+            result += formatted_expiration;
+        }
+
+        return result + L"}";
+        //! [CookieObject]
+    }
 
   // Checks whether the specified IID equals the IID of the specified type and
   // if so casts the "this" pointer to T and returns it. Returns nullptr on
@@ -2110,13 +2261,14 @@ private:
   webview2_com_handler_cb_t m_cb;
   std::atomic<ULONG> m_ref_count{1};
   std::function<HRESULT()> m_attempt_handler;
+  std::string m_cookie;
   unsigned int m_max_attempts = 5;
   unsigned int m_attempts = 0;
 };
 
 class win32_edge_engine {
 public:
-  win32_edge_engine(bool debug, void *window) {
+  win32_edge_engine(bool debug, const char *datapath, void *window) : m_datapath(datapath) {
     if (!is_webview2_available()) {
       return;
     }
@@ -2329,6 +2481,35 @@ public:
     m_webview->NavigateToString(widen_string(html).c_str());
   }
 
+  const char* getDomainCookie(const std::string url) {
+    ICoreWebView2_2 *webview2 = nullptr;
+    ICoreWebView2CookieManager *cookie_manager = nullptr;
+#define METHOD_COM_INTERFACE
+#ifdef METHOD_JAVASCRIPT
+    HRESULT ret = m_webview->ExecuteScript(L"document.cookie", m_com_handler);
+    printf("ExecuteScript: %d\n", ret);
+    return m_com_handler->get_cookie();
+#elif defined(METHOD_COM_INTERFACE)
+    HRESULT ret = m_webview->QueryInterface(mswebview2::IID_ICoreWebView2_2, (LPVOID *)&webview2);
+    if (webview2 == nullptr) {
+        printf("QueryInterface ICoreWebView2_2 failed: %d\n", ret);
+        return "QueryInterface failed";
+    }
+    ret = webview2->get_CookieManager(&cookie_manager);
+    if (cookie_manager == nullptr) {
+        printf("get_CookieManager failed: %d\n", ret);
+        return "get_CookieManager failed";
+    }
+
+    std::wstring wstrUrl = detail::widen_string(url);
+    ret = cookie_manager->GetCookies(wstrUrl.c_str(), m_com_handler);
+    printf("cookie_manager GetCookies ret: %d\n", ret);
+
+    return m_com_handler->get_cookie();
+#endif
+  }
+
+
 private:
   bool embed(HWND wnd, bool debug, msg_cb_t cb) {
     std::atomic_flag flag = ATOMIC_FLAG_INIT;
@@ -2345,6 +2526,9 @@ private:
     }
     wchar_t userDataFolder[MAX_PATH];
     PathCombineW(userDataFolder, dataPath, currentExeName);
+    printf("userDataFolder: %s\ndataPath: %s\ncurrentExeName:%s, inparam[datapath]:%s\n",
+        narrow_string(userDataFolder).c_str(),
+        narrow_string(dataPath).c_str(), "test", m_datapath.c_str());
 
     m_com_handler = new webview2_com_handler(
         wnd, cb,
@@ -2359,6 +2543,10 @@ private:
           m_webview = webview;
           flag.clear();
         });
+    
+    int len = MultiByteToWideChar(CP_UTF8, 0, m_datapath.c_str(), -1, userDataFolder, 0);
+    MultiByteToWideChar(CP_UTF8, 0, m_datapath.c_str(), -1, userDataFolder, len);
+    printf("translated userDataPath:%s\n", narrow_string(userDataFolder).c_str());
 
     m_com_handler->set_attempt_handler([&] {
       return m_webview2_loader.create_environment_with_options(
@@ -2452,6 +2640,7 @@ private:
   ICoreWebView2Controller *m_controller = nullptr;
   webview2_com_handler *m_com_handler = nullptr;
   mswebview2::loader m_webview2_loader;
+  std::string m_datapath;
   int m_dpi{};
 };
 
@@ -2467,8 +2656,8 @@ namespace webview {
 
 class webview : public browser_engine {
 public:
-  webview(bool debug = false, void *wnd = nullptr)
-      : browser_engine(debug, wnd) {}
+  webview(bool debug = false, const char *datapath = nullptr, void *wnd = nullptr)
+      : browser_engine(debug, datapath, wnd) {}
 
   void navigate(const std::string &url) {
     if (url.empty()) {
@@ -2565,8 +2754,8 @@ private:
 };
 } // namespace webview
 
-WEBVIEW_API webview_t webview_create(int debug, void *wnd) {
-  auto w = new webview::webview(debug, wnd);
+WEBVIEW_API webview_t webview_create(int debug, const char *datapath, void *wnd) {
+  auto w = new webview::webview(debug, datapath, wnd);
   if (!w->window()) {
     delete w;
     return nullptr;
@@ -2593,6 +2782,10 @@ WEBVIEW_API void webview_dispatch(webview_t w, void (*fn)(webview_t, void *),
 
 WEBVIEW_API void *webview_get_window(webview_t w) {
   return static_cast<webview::webview *>(w)->window();
+}
+
+WEBVIEW_API const char* webview_get_cookie(webview_t w, const char *url) {
+  return static_cast<webview::webview *>(w)->getDomainCookie(url);
 }
 
 WEBVIEW_API void webview_set_title(webview_t w, const char *title) {
