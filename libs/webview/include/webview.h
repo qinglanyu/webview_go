@@ -1130,7 +1130,6 @@ using browser_engine = detail::cocoa_wkwebview_engine;
 #include <shlwapi.h>
 #include <stdlib.h>
 #include <windows.h>
-#include <stdio.h>
 #include <regex>
 
 #include "WebView2.h"
@@ -1197,19 +1196,6 @@ inline std::string narrow_string(const std::wstring &input) {
   }
   // Failed to convert string from UTF-16 to UTF-8
   return std::string();
-}
-
-std::string WChar2Ansi(LPCWSTR pwszSrc) {
-    if (pwszSrc == nullptr) {
-        return "";
-    }
-    int len = WideCharToMultiByte(CP_ACP, 0, pwszSrc, -1, nullptr, 0, nullptr, nullptr);
-    if (len == 0) {
-        return "";
-    }
-    std::string str(len, '\0');
-    WideCharToMultiByte(CP_ACP, 0, pwszSrc, -1, &str[0], len, nullptr, nullptr);
-    return str;
 }
 
 // Parses a version string with 1-4 integral components, e.g. "1.2.3.4".
@@ -1970,10 +1956,6 @@ static constexpr auto permission_requested =
     cast_info_t<ICoreWebView2PermissionRequestedEventHandler>{
         IID_ICoreWebView2PermissionRequestedEventHandler};
 
-static constexpr auto executescript_completed = 
-    cast_info_t<ICoreWebView2ExecuteScriptCompletedHandler>{
-        IID_ICoreWebView2ExecuteScriptCompletedHandler};
-
 static constexpr auto cookies_got =
     cast_info_t<ICoreWebView2GetCookiesCompletedHandler>{
         IID_ICoreWebView2GetCookiesCompletedHandler};
@@ -1988,7 +1970,6 @@ class webview2_com_handler
     : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
       public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
       public ICoreWebView2WebMessageReceivedEventHandler,
-      public ICoreWebView2ExecuteScriptCompletedHandler,
       public ICoreWebView2GetCookiesCompletedHandler,
       public ICoreWebView2PermissionRequestedEventHandler {
   using webview2_com_handler_cb_t =
@@ -2032,7 +2013,6 @@ public:
     if (cast_if_equal_iid(riid, controller_completed, ppv) ||
         cast_if_equal_iid(riid, environment_completed, ppv) ||
         cast_if_equal_iid(riid, message_received, ppv) ||
-        cast_if_equal_iid(riid, executescript_completed, ppv) ||
         cast_if_equal_iid(riid, cookies_got, ppv) ||
         cast_if_equal_iid(riid, permission_requested, ppv)) {
       return S_OK;
@@ -2078,7 +2058,6 @@ public:
       ICoreWebView2 *sender, ICoreWebView2WebMessageReceivedEventArgs *args) {
     LPWSTR message;
     args->TryGetWebMessageAsString(&message);
-    printf("invoke msg: %s\n", narrow_string(message).c_str());
     m_msgCb(narrow_string(message));
     sender->PostWebMessageAsString(message);
 
@@ -2096,17 +2075,8 @@ public:
     return S_OK;
   }
 
-    HRESULT STDMETHODCALLTYPE Invoke(/* [in] */ HRESULT errorCode, /* [in] */ LPCWSTR resultObjectAsJson) {
-        // get cookie by ExecuteScriopt;
-        m_cookie = WChar2Ansi(resultObjectAsJson);
-        printf("ICoreWebView2ExecuteScriptCompletedHandler Invoke get cookie: %s\n", m_cookie.c_str());
-        return errorCode;
-    }
-
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2CookieList *cookieList) {
-        printf("getcookieList result: %d\n", result);
         if (/*result == S_OK*/1) {
-            printf("make cookie refer to learn.microsoft.com\n");
             // parse cookieList to m_cookie refer to 
             // https://learn.microsoft.com/zh-cn/microsoft-edge/webview2/reference/win32/icorewebview2cookiemanager?view=webview2-1.0.2210.55#getcookies
             std::wstring wstrResult;
@@ -2131,7 +2101,6 @@ public:
                 wstrResult += L"]";
             }
             m_cookie = narrow_string(wstrResult);
-            printf("the combined cookie:%s\n", m_cookie.c_str());
         }
         return result;
     }
@@ -2484,29 +2453,18 @@ public:
   const char* getDomainCookie(const std::string url) {
     ICoreWebView2_2 *webview2 = nullptr;
     ICoreWebView2CookieManager *cookie_manager = nullptr;
-#define METHOD_COM_INTERFACE
-#ifdef METHOD_JAVASCRIPT
-    HRESULT ret = m_webview->ExecuteScript(L"document.cookie", m_com_handler);
-    printf("ExecuteScript: %d\n", ret);
-    return m_com_handler->get_cookie();
-#elif defined(METHOD_COM_INTERFACE)
-    HRESULT ret = m_webview->QueryInterface(mswebview2::IID_ICoreWebView2_2, (LPVOID *)&webview2);
+    m_webview->QueryInterface(mswebview2::IID_ICoreWebView2_2, (LPVOID *)&webview2);
     if (webview2 == nullptr) {
-        printf("QueryInterface ICoreWebView2_2 failed: %d\n", ret);
         return "QueryInterface failed";
     }
-    ret = webview2->get_CookieManager(&cookie_manager);
+    webview2->get_CookieManager(&cookie_manager);
     if (cookie_manager == nullptr) {
-        printf("get_CookieManager failed: %d\n", ret);
         return "get_CookieManager failed";
     }
 
     std::wstring wstrUrl = detail::widen_string(url);
-    ret = cookie_manager->GetCookies(wstrUrl.c_str(), m_com_handler);
-    printf("cookie_manager GetCookies ret: %d\n", ret);
-
+    cookie_manager->GetCookies(wstrUrl.c_str(), m_com_handler);
     return m_com_handler->get_cookie();
-#endif
   }
 
 
@@ -2526,9 +2484,6 @@ private:
     }
     wchar_t userDataFolder[MAX_PATH];
     PathCombineW(userDataFolder, dataPath, currentExeName);
-    printf("userDataFolder: %s\ndataPath: %s\ncurrentExeName:%s, inparam[datapath]:%s\n",
-        narrow_string(userDataFolder).c_str(),
-        narrow_string(dataPath).c_str(), "test", m_datapath.c_str());
 
     m_com_handler = new webview2_com_handler(
         wnd, cb,
@@ -2544,9 +2499,10 @@ private:
           flag.clear();
         });
     
-    int len = MultiByteToWideChar(CP_UTF8, 0, m_datapath.c_str(), -1, userDataFolder, 0);
-    MultiByteToWideChar(CP_UTF8, 0, m_datapath.c_str(), -1, userDataFolder, len);
-    printf("translated userDataPath:%s\n", narrow_string(userDataFolder).c_str());
+    if (!m_datapath.empty()) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, m_datapath.c_str(), -1, userDataFolder, 0);
+        MultiByteToWideChar(CP_UTF8, 0, m_datapath.c_str(), -1, userDataFolder, len);
+    }
 
     m_com_handler->set_attempt_handler([&] {
       return m_webview2_loader.create_environment_with_options(
